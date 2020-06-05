@@ -42,12 +42,16 @@ from ezibpy.utils import (
     order_to_dict, contract_to_dict
 )
 
+from qtpylib.enums import Timeframes
+
 decimal.getcontext().prec = 5
 
 # =============================================
 # check min, python version
 if sys.version_info < (3, 4):
     raise SystemError("QTPyLib requires Python version >= 3.4")
+
+
 # =============================================
 
 
@@ -56,6 +60,7 @@ class make_object:
 
     def __init__(self, **entries):
         self.__dict__.update(entries)
+
 
 # ---------------------------------------------
 
@@ -66,6 +71,7 @@ def read_single_argv(param, default=None):
         args = args[1].strip().split(" ")[0]
         return args if "-" not in args else None
     return default
+
 
 # ---------------------------------------------
 
@@ -81,7 +87,8 @@ def multi_shift(df, window):
     dfs = [df.shift(i) for i in np.arange(window)]
     for ix, df_item in enumerate(dfs[1:]):
         dfs[ix + 1].columns = [str(col) for col in df_item.columns + str(ix + 1)]
-    return pd.concat(dfs, 1, sort=True) #.apply(list, 1)
+    return pd.concat(dfs, 1, sort=True)  # .apply(list, 1)
+
 
 # ---------------------------------------------
 
@@ -114,7 +121,6 @@ def to_decimal(number, points=None):
 # ---------------------------------------------
 
 def week_started_date(as_datetime=False):
-
     today = datetime.datetime.utcnow()
     start = today - datetime.timedelta((today.weekday() + 1) % 7)
     dt = start + relativedelta.relativedelta(weekday=relativedelta.SU(-1))
@@ -351,6 +357,69 @@ def ib_duration_str(start_date=None):
 
 # ---------------------------------------------
 
+def wb_resolution(res="T"):
+    periods = ("".join([s for s in res if s.isdigit()]))
+    periods = int(periods) if len(periods) else 0
+    res = res.lower()
+
+    if periods > 0:
+        if "min" in res or 'm' in res:
+            return "m" + str(periods), periods
+        elif "hour" in res or "H" in res:
+            mins = periods * 60
+            return "m" + str(mins), mins
+    else:
+        if "m" in res:
+            return "m1", 1
+        elif "day" in res or "d" in res:
+            return "d1", 24 * 60
+        elif "week" in res or "W" in res:
+            # if periods > 1:
+            #     raise Exception('week %s not supported', periods)
+            return "w1", 7 * 24 * 60
+        elif "month" in res:
+            return "mth1", 31 * 24 * 60
+        elif "quarter" in res or "q" in res:
+            return "mth3", 3 * 31 * 60
+        elif "year" in res or "y" in res:
+            return "y1", 365 * 24 * 60
+    raise Exception("unknown resolution provided")
+
+
+# ---------------------------------------------
+def wb_lookback_str(start_date=None, end_date=datetime.datetime.utcnow(), resolution=None):
+    now = end_date
+
+    if is_number(start_date):
+        diff = now - datetime.datetime.fromtimestamp(float(start_date))
+    elif isinstance(start_date, str):
+        diff = now - parse_date(start_date)
+    elif isinstance(start_date, datetime.datetime):
+        diff = now - start_date
+    else:
+        return None
+
+    # get diff
+    day_diff = diff.days
+    min_diff = int(diff.seconds / 60)
+
+    # small diff?
+    if day_diff < 0 or min_diff < 1:
+        return 0
+
+    # return str(second_diff)+ " S"
+    if day_diff == 0 and min_diff > 1:
+        return min_diff / Timeframes.timeframe_to_one_minutes(resolution)
+    if 31 > day_diff > 0:
+        return (min_diff + day_diff * 24 * 60) / Timeframes.timeframe_to_one_minutes(resolution)
+    if 365 > day_diff > 31:
+        return (min_diff + day_diff * 24 * 60) / Timeframes.timeframe_to_one_minutes(resolution)
+
+    return (min_diff + day_diff * 24 * 60) / Timeframes.timeframe_to_one_minutes(resolution)
+
+
+# ---------------------------------------------
+
 def datetime64_to_datetime(dt):
     """ convert numpy's datetime64 to datetime """
     dt64 = np.datetime64(dt)
@@ -438,7 +507,7 @@ def is_third_friday(day=None):
     """ check if day is month's 3rd friday """
     day = day if day is not None else datetime.datetime.now()
     defacto_friday = (day.weekday() == 4) or (
-        day.weekday() == 3 and day.hour() >= 17)
+            day.weekday() == 3 and day.hour() >= 17)
     return defacto_friday and 14 < day.day < 22
 
 
@@ -480,6 +549,7 @@ def datetime_to_timezone(date, tz="UTC"):
     if not date.tzinfo:
         date = date.replace(tzinfo=timezone(get_timezone()))
     return date.astimezone(timezone(tz))
+
 
 # ---------------------------------------------
 
@@ -572,12 +642,11 @@ def fix_timezone(df, freq, tz=None):
 
 
 # =============================================
-# resample baed on time / tick count
+# resample based on time / tick count
 # =============================================
 
 def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
              sync_last_timestamp=True):
-
     def __finalize(data, tz=None):
         # figure out timezone
         try:
@@ -597,13 +666,12 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
         # drop duplicate rows per instrument
         data.loc[:, '_idx_'] = data.index
         data.drop_duplicates(
-            subset=['_idx_', 'symbol', 'symbol_group', 'asset_class'],
+            subset=['_idx_', 'symbol'],
             keep='last', inplace=True)
         data.drop('_idx_', axis=1, inplace=True)
 
         return data
         # return data[~data.index.duplicated(keep='last')]
-
 
     def __resample_ticks(data, freq=1000, by='last'):
         """
@@ -640,7 +708,7 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                                  (df['mark'] / freq), np.nan)
         else:
             df['grp'] = [np.nan if i %
-                         freq else i for i in range(len(df[price_col]))]
+                                   freq else i for i in range(len(df[price_col]))]
 
         df.loc[:1, 'grp'] = 0
 
@@ -660,22 +728,22 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
 
         # build ohlc(v) pd.dataframe from new grp column
         newdf = pd.DataFrame({
-            'open':   groupped[price_col].first(),
-            'high':   groupped[price_col].max(),
-            'low':    groupped[price_col].min(),
-            'close':  groupped[price_col].last(),
+            'open': groupped[price_col].first(),
+            'high': groupped[price_col].max(),
+            'low': groupped[price_col].min(),
+            'close': groupped[price_col].last(),
             'volume': groupped[size_col].sum(),
 
-            'opt_price':      groupped['opt_price'].last(),
+            'opt_price': groupped['opt_price'].last(),
             'opt_underlying': groupped['opt_underlying'].last(),
-            'opt_dividend':   groupped['opt_dividend'].last(),
-            'opt_volume':     groupped['opt_volume'].last(),
-            'opt_iv':         groupped['opt_iv'].last(),
-            'opt_oi':         groupped['opt_oi'].last(),
-            'opt_delta':      groupped['opt_delta'].last(),
-            'opt_gamma':      groupped['opt_gamma'].last(),
-            'opt_theta':      groupped['opt_theta'].last(),
-            'opt_vega':       groupped['opt_vega'].last()
+            'opt_dividend': groupped['opt_dividend'].last(),
+            'opt_volume': groupped['opt_volume'].last(),
+            'opt_iv': groupped['opt_iv'].last(),
+            'opt_oi': groupped['opt_oi'].last(),
+            'opt_delta': groupped['opt_delta'].last(),
+            'opt_gamma': groupped['opt_gamma'].last(),
+            'opt_theta': groupped['opt_theta'].last(),
+            'opt_vega': groupped['opt_vega'].last()
         })
 
         # set index to timestamp
@@ -692,12 +760,12 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
     if sync_last_timestamp:
         data.loc[:, '_idx_'] = data.index
         start_date = str(data.groupby(["symbol"])[
-                         ['_idx_']].min().max().values[-1]).replace('T', ' ')
+                             ['_idx_']].min().max().values[-1]).replace('T', ' ')
         end_date = str(data.groupby(["symbol"])[
-                       ['_idx_']].max().min().values[-1]).replace('T', ' ')
+                           ['_idx_']].max().min().values[-1]).replace('T', ' ')
 
         data = data[(data.index <= end_date)].drop_duplicates(
-            subset=['_idx_', 'symbol', 'symbol_group', 'asset_class'],
+            subset=['_idx_', 'symbol'],
             keep='first')
 
         # try also sync start date
@@ -709,7 +777,7 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
     # resample
     periods = int("".join([s for s in resolution if s.isdigit()]))
     meta_data = data.groupby(["symbol"])[
-        ['symbol', 'symbol_group', 'asset_class']].last()
+        ['symbol']].last()
     combined = []
 
     if "K" in resolution:
@@ -718,14 +786,14 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                 symdata = __resample_ticks(data[data['symbol'] == sym].copy(),
                                            freq=periods, by='last')
                 symdata['symbol'] = sym
-                symdata['symbol_group'] = meta_data[
-                    meta_data.index == sym]['symbol_group'].values[0]
-                symdata['asset_class'] = meta_data[
-                    meta_data.index == sym]['asset_class'].values[0]
+                # symdata['symbol_group'] = meta_data[
+                #     meta_data.index == sym]['symbol_group'].values[0]
+                # symdata['asset_class'] = meta_data[
+                #     meta_data.index == sym]['asset_class'].values[0]
 
                 # cleanup
                 symdata.dropna(inplace=True, subset=[
-                                'open', 'high', 'low', 'close', 'volume'])
+                    'open', 'high', 'low', 'close', 'volume'])
                 if sym[-3:] in ("OPT", "FOP"):
                     symdata.dropna(inplace=True)
 
@@ -739,14 +807,14 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                 symdata = __resample_ticks(data[data['symbol'] == sym].copy(),
                                            freq=periods, by='lastsize')
                 symdata['symbol'] = sym
-                symdata['symbol_group'] = meta_data[
-                    meta_data.index == sym]['symbol_group'].values[0]
-                symdata['asset_class'] = meta_data[
-                    meta_data.index == sym]['asset_class'].values[0]
+                # symdata['symbol_group'] = meta_data[
+                #     meta_data.index == sym]['symbol_group'].values[0]
+                # symdata['asset_class'] = meta_data[
+                #     meta_data.index == sym]['asset_class'].values[0]
 
                 # cleanup
                 symdata.dropna(inplace=True, subset=[
-                                'open', 'high', 'low', 'close', 'volume'])
+                    'open', 'high', 'low', 'close', 'volume'])
                 if sym[-3:] in ("OPT", "FOP"):
                     symdata.dropna(inplace=True)
 
@@ -757,34 +825,35 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
     # continue...
     else:
         ticks_ohlc_dict = {
-            'lastsize':       'sum',
-            'opt_price':      'last',
+            'lastsize': 'sum',
+            'opt_price': 'last',
             'opt_underlying': 'last',
-            'opt_dividend':   'last',
-            'opt_volume':     'last',
-            'opt_iv':         'last',
-            'opt_oi':         'last',
-            'opt_delta':      'last',
-            'opt_gamma':      'last',
-            'opt_theta':      'last',
-            'opt_vega':       'last'
+            'opt_dividend': 'last',
+            'opt_volume': 'last',
+            'opt_iv': 'last',
+            'opt_oi': 'last',
+            'opt_delta': 'last',
+            'opt_gamma': 'last',
+            'opt_theta': 'last',
+            'opt_vega': 'last'
         }
         bars_ohlc_dict = {
-            'open':           'first',
-            'high':           'max',
-            'low':            'min',
-            'close':          'last',
-            'volume':         'sum',
-            'opt_price':      'last',
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'vwap': 'last',
+            'opt_price': 'last',
             'opt_underlying': 'last',
-            'opt_dividend':   'last',
-            'opt_volume':     'last',
-            'opt_iv':         'last',
-            'opt_oi':         'last',
-            'opt_delta':      'last',
-            'opt_gamma':      'last',
-            'opt_theta':      'last',
-            'opt_vega':       'last'
+            'opt_dividend': 'last',
+            'opt_volume': 'last',
+            'opt_iv': 'last',
+            'opt_oi': 'last',
+            'opt_delta': 'last',
+            'opt_gamma': 'last',
+            'opt_theta': 'last',
+            'opt_vega': 'last'
         }
 
         for sym in meta_data.index.values:
@@ -816,7 +885,6 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                 original_length = len(data[data['symbol'] == sym])
                 symdata = data[data['symbol'] == sym].resample(
                     resolution).apply(bar_dict).fillna(value=np.nan)
-
                 # deal with new rows caused by resample
                 if len(symdata) > original_length:
                     # volume is 0 on rows created using resample
@@ -826,18 +894,18 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                     # no fill / return original index
                     if ffill:
                         symdata['open'] = np.where(symdata['volume'] <= 0,
-                                                    symdata['close'], symdata['open'])
+                                                   symdata['close'], symdata['open'])
                         symdata['high'] = np.where(symdata['volume'] <= 0,
-                                                    symdata['close'], symdata['high'])
+                                                   symdata['close'], symdata['high'])
                         symdata['low'] = np.where(symdata['volume'] <= 0,
-                                                    symdata['close'], symdata['low'])
+                                                  symdata['close'], symdata['low'])
                     else:
                         symdata['open'] = np.where(symdata['volume'] <= 0,
-                                                    np.nan, symdata['open'])
+                                                   np.nan, symdata['open'])
                         symdata['high'] = np.where(symdata['volume'] <= 0,
-                                                    np.nan, symdata['high'])
+                                                   np.nan, symdata['high'])
                         symdata['low'] = np.where(symdata['volume'] <= 0,
-                                                    np.nan, symdata['low'])
+                                                  np.nan, symdata['low'])
                         symdata['close'] = np.where(symdata['volume'] <= 0,
                                                     np.nan, symdata['close'])
 
@@ -846,14 +914,14 @@ def resample(data, resolution="1T", tz=None, ffill=True, dropna=False,
                     symdata.dropna(inplace=True)
 
             symdata['symbol'] = sym
-            symdata['symbol_group'] = meta_data[meta_data.index ==
-                                                sym]['symbol_group'].values[0]
-            symdata['asset_class'] = meta_data[meta_data.index ==
-                                                sym]['asset_class'].values[0]
+            # symdata['symbol_group'] = meta_data[meta_data.index ==
+            #                                     sym]['symbol_group'].values[0]
+            # symdata['asset_class'] = meta_data[meta_data.index ==
+            #                                    sym]['asset_class'].values[0]
 
             # cleanup
             symdata.dropna(inplace=True, subset=[
-                            'open', 'high', 'low', 'close', 'volume'])
+                'open', 'high', 'low', 'close', 'volume'])
             if sym[-3:] in ("OPT", "FOP"):
                 symdata.dropna(inplace=True)
 
@@ -919,7 +987,6 @@ class DataStore():
         if "symbol" not in recorded.columns:
             return
 
-
         # group by symbol
         recorded['datetime'] = recorded.index
         data = recorded.groupby(['symbol', 'datetime'], as_index=False).sum()
@@ -927,7 +994,6 @@ class DataStore():
 
         symbols = data['symbol'].unique().tolist()
         data.drop(columns=['symbol'], inplace=True)
-
 
         # cleanup:
 
@@ -958,7 +1024,7 @@ class DataStore():
 
         # cleanup columns names before saving...
         recorded.columns = [col.replace('_FUT_', '_').replace(
-                            '_OPT_OPT_', '_OPT_') for col in recorded.columns]
+            '_OPT_OPT_', '_OPT_') for col in recorded.columns]
 
         # save
         if ".csv" in self.output_file:

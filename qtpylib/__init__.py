@@ -39,6 +39,7 @@ __all__ = [
     'blotter',
     'algo',
     'broker',
+    'webull',
     'tools',
     'sms',
     'indicators',

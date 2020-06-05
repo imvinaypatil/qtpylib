@@ -29,6 +29,8 @@ from qtpylib import futures
 # check min, python version
 if sys.version_info < (3, 4):
     raise SystemError("QTPyLib requires Python version >= 3.4")
+
+
 # =============================================
 
 
@@ -59,8 +61,7 @@ class Instrument(str):
             # this produce a "IndexingError using Boolean Indexing" (on rare occasions)
             return df[(df['symbol'] == symbol) | (df['symbol_group'] == symbol)].copy()
         except Exception as e:
-            df = pd_concat([df[df['symbol'] == symbol],
-                            df[df['symbol_group'] == symbol]], sort=True)
+            df = pd_concat([df[df['symbol'] == symbol]], sort=True)
             df.loc[:, '_idx_'] = df.index
             return df.drop_duplicates(subset=['_idx_'], keep='last').drop('_idx_', axis=1)
 
@@ -88,10 +89,10 @@ class Instrument(str):
         # if lookback is not None:
         #     bars = bars[-lookback:]
 
-        if not bars.empty > 0 and bars['asset_class'].values[-1] not in ("OPT", "FOP"):
+        if not bars.empty > 0:  # and bars['asset_class'].values[-1] not in ("OPT", "FOP")
             bars.drop(bars.columns[
-                bars.columns.str.startswith('opt_')].tolist(),
-                inplace=True, axis=1)
+                          bars.columns.str.startswith('opt_')].tolist(),
+                      inplace=True, axis=1)
 
         if as_dict:
             bars.loc[:, 'datetime'] = bars.index
@@ -129,8 +130,8 @@ class Instrument(str):
 
         if not ticks.empty and ticks['asset_class'].values[-1] not in ("OPT", "FOP"):
             ticks.drop(ticks.columns[
-                ticks.columns.str.startswith('opt_')].tolist(),
-                inplace=True, axis=1)
+                           ticks.columns.str.startswith('opt_')].tolist(),
+                       inplace=True, axis=1)
 
         if as_dict:
             ticks.loc[:, 'datetime'] = ticks.index
@@ -578,7 +579,7 @@ class Instrument(str):
         if req_margin[timeframe] is not None:
             if 'AvailableFunds' in self.parent.account:
                 return int(math.floor(self.parent.account['AvailableFunds'
-                                                          ] / req_margin[timeframe]))
+                                      ] / req_margin[timeframe]))
 
         return None
 

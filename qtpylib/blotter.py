@@ -31,15 +31,19 @@ import tempfile
 import time
 import glob
 import subprocess
+import types
+from collections import defaultdict
 
 from datetime import datetime
 from abc import ABCMeta
+from math import ceil
 
 import zmq
 import pandas as pd
 from dateutil.parser import parse as parse_date
 
 import pymysql
+from matplotlib.pyplot import plot
 from pymysql.constants.CLIENT import MULTI_STATEMENTS
 
 from numpy import (
@@ -52,9 +56,16 @@ from ezibpy import (
     ezIBpy, dataTypes as ibDataTypes
 )
 
+from qtpylib.enums import Timeframes
+from qtpylib.mongodb.repository.OHLC import OHLC
+from qtpylib.mongodb.repository.Tick import Tick
+from .webull import webull
+
 from qtpylib import (
     tools, asynctools, path, futures, __version__
 )
+
+from mongoengine import connect, NotUniqueError, Q
 
 # =============================================
 # check min, python version
@@ -190,7 +201,7 @@ class Blotter():
         # track historical data download status
         self.backfilled = False
         self.backfilled_symbols = []
-        self.backfill_resolution = "1 min"
+        self.backfill_resolution = Timeframes.MINUTE_1
 
         # be aware of thread count
         self.threads = asynctools.multitasking.getPool(__name__)['threads']
@@ -202,12 +213,12 @@ class Blotter():
 
         self.log_blotter.info("Blotter stopped...")
 
-        if self.ibConn is not None:
+        if self.wb is not None:
             self.log_blotter.info("Cancel market data...")
-            self.ibConn.cancelMarketData()
+            self.wb.cancelMarketDataSubscription()
 
             self.log_blotter.info("Disconnecting...")
-            self.ibConn.disconnect()
+            self.wb.disconnect()
 
         if not self.duplicate_run:
             self.log_blotter.info("Deleting runtime args...")
@@ -313,7 +324,9 @@ class Blotter():
         return args
 
     # -------------------------------------------
-    def ibCallback(self, caller, msg, **kwargs):
+    def callbacks(self, caller, msg, **kwargs):
+        # self.log_blotter.info("caller: [%s]", caller)
+        # self.log_blotter.info("Message Recieved: %s", msg)
 
         if caller == "handleConnectionClosed":
             self.log_blotter.info("Lost conncetion to Interactive Brokers...")
@@ -323,17 +336,23 @@ class Blotter():
         elif caller == "handleHistoricalData":
             self.on_ohlc_received(msg, kwargs)
 
-        elif caller == "handleTickString":
-            self.on_tick_string_received(msg.tickerId, kwargs)
+        # elif caller == "handleTickString":
+        #     self.on_tick_string_received(msg['tickerId'], kwargs)
 
-        elif caller == "handleTickPrice" or caller == "handleTickSize":
-            self.on_quote_received(msg.tickerId)
+        elif caller == "handleMarketQuote":
+            self.on_quote_received(kwargs['tickerId'])
+
+        elif caller == "handleTickPrice" or caller == "handleTickSize" or caller == "handleTickString":
+            tickerId = msg['tickerId']
+            self.on_tick_string_received(tickerId, kwargs)
+            # request for quote
+            self.wb.requestMarketQuote(self.wb.contracts[tickerId])
 
         elif caller in "handleTickOptionComputation":
-            self.on_option_computation_received(msg.tickerId)
+            self.on_option_computation_received(msg['tickerId'])
 
         elif caller == "handleMarketDepth":
-            self.on_orderbook_received(msg.tickerId)
+            self.on_orderbook_received(msg['tickerId'])
 
         elif caller == "handleError":
             # don't display connection errors on ctrl+c
@@ -351,103 +370,103 @@ class Blotter():
 
     # -------------------------------------------
     def on_ohlc_received(self, msg, kwargs):
-        symbol = self.ibConn.tickerSymbol(msg.reqId)
+        symbol = self.wb.tickerSymbol(kwargs['tickerId'])
+
+        # print(msg)
+        # msg.index.names = ['datetime']
+        msg['datetime'] = msg.index
+        data = msg.to_dict(orient='records')
+
+        for row in data:
+            params = {"tickerId": str(kwargs['tickerId']), "symbol": symbol,
+                      # "symbol_group": tools.gen_symbol_group(symbol), "asset_class": tools.gen_asset_class(
+                      # symbol),
+                      "datetime": tools.datetime_to_timezone(
+                          parse_date(str(row['datetime'])), tz="UTC"
+                      ).strftime("%Y-%m-%d %H:%M:%S"), "open": tools.to_decimal(row['open']),
+                      "high": tools.to_decimal(row['high']), "low": tools.to_decimal(row['low']),
+                      "close": tools.to_decimal(row['close']), "volume": int(row['volume']),
+                      "vwap": tools.to_decimal(row['vwap']), "resolution": self.backfill_resolution}
+
+            # incmoing second data
+            # if "sec" in self.backfill_resolution:
+            #     params["last"] = tools.to_decimal(row['close'])
+            #     params["lastsize"] = int(row['volume'])  # msg.count?
+            #     params["bid"] = 0
+            #     params["bidsize"] = 0
+            #     params["ask"] = 0
+            #     params["asksize"] = 0
+            #     params["kind"] = "TICK"
+            # else:
+
+            ohlc = OHLC(**params)
+            # store in db
+            try:
+                self.log2db(data=ohlc)
+            except NotUniqueError:
+                pass
+                # self.log_blotter.info("OHLC row already exists in db ", ohlc.to_json())
 
         if kwargs["completed"]:
             self.backfilled_symbols.append(symbol)
             tickers = set(
-                {v: k for k, v in self.ibConn.tickerIds.items() if v.upper() != "SYMBOL"}.keys())
+                {v: k for k, v in self.wb.tickerIds.items() if v.upper() != "SYMBOL"}.keys())
             if tickers == set(self.backfilled_symbols):
                 self.backfilled = True
                 print(".")
-
-            try:
-                self.ibConn.cancelHistoricalData(
-                    self.ibConn.contracts[msg.reqId])
-            except Exception as e:
-                pass
-
-        else:
-            data = {
-                "symbol": symbol,
-                "symbol_group": tools.gen_symbol_group(symbol),
-                "asset_class": tools.gen_asset_class(symbol),
-                "timestamp": tools.datetime_to_timezone(
-                    datetime.fromtimestamp(int(msg.date)), tz="UTC"
-                ).strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            # incmoing second data
-            if "sec" in self.backfill_resolution:
-                data["last"] = tools.to_decimal(msg.close)
-                data["lastsize"] = int(msg.volume)  # msg.count?
-                data["bid"] = 0
-                data["bidsize"] = 0
-                data["ask"] = 0
-                data["asksize"] = 0
-                data["kind"] = "TICK"
-            else:
-                data["open"] = tools.to_decimal(msg.open)
-                data["high"] = tools.to_decimal(msg.high)
-                data["low"] = tools.to_decimal(msg.low)
-                data["close"] = tools.to_decimal(msg.close)
-                data["volume"] = int(msg.volume)
-                data["kind"] = "BAR"
-
-            # print(data)
-
-            # store in db
-            self.log2db(data, data["kind"])
 
     # -------------------------------------------
     @asynctools.multitasking.task
     def on_tick_string_received(self, tickerId, kwargs):
 
         # kwargs is empty
-        if not kwargs:
-            return
+        # if not kwargs:
+        #     return
 
         data = None
-        symbol = self.ibConn.tickerSymbol(tickerId)
+        symbol = self.wb.tickerSymbol(tickerId)
 
         # for instruments that receive RTVOLUME events
         if "tick" in kwargs:
             self.rtvolume.add(symbol)
             data = {
                 # available data from ib
-                "symbol":       symbol,
+                "symbol": symbol,
                 "symbol_group": tools.gen_symbol_group(symbol),  # ES_F, ...
-                "asset_class":  tools.gen_asset_class(symbol),
-                "timestamp":    kwargs['tick']['time'],
-                "last":         tools.to_decimal(kwargs['tick']['last']),
-                "lastsize":     int(kwargs['tick']['size']),
-                "bid":          tools.to_decimal(kwargs['tick']['bid']),
-                "ask":          tools.to_decimal(kwargs['tick']['ask']),
-                "bidsize":      int(kwargs['tick']['bidsize']),
-                "asksize":      int(kwargs['tick']['asksize']),
+                "asset_class": tools.gen_asset_class(symbol),
+                "timestamp": kwargs['tick']['time'],
+                "last": tools.to_decimal(kwargs['tick']['last']),
+                "lastsize": int(kwargs['tick']['size']),
+                "bid": tools.to_decimal(kwargs['tick']['bid']),
+                "ask": tools.to_decimal(kwargs['tick']['ask']),
+                "bidsize": int(kwargs['tick']['bidsize']),
+                "asksize": int(kwargs['tick']['asksize']),
                 # "wap":          kwargs['tick']['wap'],
             }
 
         # for instruments that DOESN'T receive RTVOLUME events (exclude options)
         elif symbol not in self.rtvolume and \
-                self.ibConn.contracts[tickerId].m_secType not in ("OPT", "FOP"):
+                self.wb.contracts[tickerId].m_secType not in ("OPT", "FOP"):
 
-            tick = self.ibConn.marketData[tickerId]
+            tick = self.wb.marketData[tickerId]
+            # print(tick)
 
             if not tick.empty and tick['last'].values[-1] > 0 < tick['lastsize'].values[-1]:
                 data = {
                     # available data from ib
-                    "symbol":       symbol,
+                    "symbol": symbol,
+                    "tickerId": str(tickerId),
                     # ES_F, ...
                     "symbol_group": tools.gen_symbol_group(symbol),
-                    "asset_class":  tools.gen_asset_class(symbol),
-                    "timestamp":    tick.index.values[-1],
-                    "last":         tools.to_decimal(tick['last'].values[-1]),
-                    "lastsize":     int(tick['lastsize'].values[-1]),
-                    "bid":          tools.to_decimal(tick['bid'].values[-1]),
-                    "ask":          tools.to_decimal(tick['ask'].values[-1]),
-                    "bidsize":      int(tick['bidsize'].values[-1]),
-                    "asksize":      int(tick['asksize'].values[-1]),
+                    "asset_class": tools.gen_asset_class(symbol),
+                    "timestamp": tick.index.values[-1],
+                    "datetime": tick.index.values[-1],
+                    "last": tools.to_decimal(tick['last'].values[-1]),
+                    "lastsize": int(tick['lastsize'].values[-1]),
+                    "buy": tools.to_decimal(tick['buy'].values[-1]),
+                    "sell": tools.to_decimal(tick['sell'].values[-1]),
+                    "buysize": int(tick['buysize'].values[-1]),
+                    "sellsize": int(tick['sellsize'].values[-1])
                     # "wap":          kwargs['tick']['wap'],
                 }
 
@@ -461,7 +480,7 @@ class Blotter():
             self.cash_ticks[symbol] = data
 
             # add options fields
-            data = tools.force_options_columns(data)
+            # data = tools.force_options_columns(data)
 
             # print('.', end="", flush=True)
             self.on_tick_received(data)
@@ -470,28 +489,27 @@ class Blotter():
     @asynctools.multitasking.task
     def on_quote_received(self, tickerId):
         try:
+            symbol = self.wb.tickerSymbol(tickerId)
 
-            symbol = self.ibConn.tickerSymbol(tickerId)
-
-            if self.ibConn.contracts[tickerId].m_secType in ("OPT", "FOP"):
-                quote = self.ibConn.optionsData[tickerId].to_dict(orient='records')[
+            if self.wb.contracts[tickerId].m_secType in ("OPT", "FOP"):
+                quote = self.wb.optionsData[tickerId].to_dict(orient='records')[
                     0]
-                quote['type'] = self.ibConn.contracts[tickerId].m_right
+                quote['type'] = self.wb.contracts[tickerId].m_right
                 quote['strike'] = tools.to_decimal(
-                    self.ibConn.contracts[tickerId].m_strike)
-                quote["symbol_group"] = self.ibConn.contracts[tickerId].m_symbol + \
-                    '_' + self.ibConn.contracts[tickerId].m_secType
+                    self.wb.contracts[tickerId].m_strike)
+                quote["symbol_group"] = self.wb.contracts[tickerId].m_symbol + \
+                                        '_' + self.wb.contracts[tickerId].m_secType
                 quote = tools.mark_options_values(quote)
             else:
-                quote = self.ibConn.marketData[tickerId].to_dict(orient='records')[
-                    0]
+                quote = self.wb.marketQuoteData[tickerId].to_dict(orient='records')[0]
                 quote["symbol_group"] = tools.gen_symbol_group(symbol)
 
             quote["symbol"] = symbol
+            quote["tickerId"] = str(tickerId)
             quote["asset_class"] = tools.gen_asset_class(symbol)
             quote['bid'] = tools.to_decimal(quote['bid'])
             quote['ask'] = tools.to_decimal(quote['ask'])
-            quote['last'] = tools.to_decimal(quote['last'])
+            # quote['last'] = tools.to_decimal(quote['last'])
             quote["kind"] = "QUOTE"
 
             # cash markets do not get RTVOLUME (handleTickString)
@@ -500,7 +518,7 @@ class Blotter():
                     float((quote['bid'] + quote['ask']) / 2), 5)
                 quote['timestamp'] = datetime.utcnow(
                 ).strftime("%Y-%m-%d %H:%M:%S.%f")
-
+                quote['datetime'] = quote['timestamp']
                 # create synthetic tick
                 if symbol in self.cash_ticks.keys() and quote['last'] != self.cash_ticks[symbol]:
                     self.on_tick_received(quote)
@@ -509,6 +527,9 @@ class Blotter():
 
                 self.cash_ticks[symbol] = quote['last']
             else:
+                quoteStore = Tick(**quote)
+                # print(quoteStore.to_json())
+                self.log2db(quoteStore)
                 self.broadcast(quote, "QUOTE")
 
         except Exception as e:
@@ -518,9 +539,9 @@ class Blotter():
     @asynctools.multitasking.task
     def on_option_computation_received(self, tickerId):
         # try:
-        symbol = self.ibConn.tickerSymbol(tickerId)
+        symbol = self.wb.tickerSymbol(tickerId)
 
-        tick = self.ibConn.optionsData[tickerId].to_dict(orient='records')[0]
+        tick = self.wb.optionsData[tickerId].to_dict(orient='records')[0]
 
         # must have values!
         for key in ('bid', 'ask', 'last', 'bidsize', 'asksize', 'lastsize',
@@ -528,11 +549,11 @@ class Blotter():
             if tick[key] == 0:
                 return
 
-        tick['type'] = self.ibConn.contracts[tickerId].m_right
+        tick['type'] = self.wb.contracts[tickerId].m_right
         tick['strike'] = tools.to_decimal(
             self.ibConn.contracts[tickerId].m_strike)
-        tick["symbol_group"] = self.ibConn.contracts[tickerId].m_symbol + \
-            '_' + self.ibConn.contracts[tickerId].m_secType
+        tick["symbol_group"] = self.wb.contracts[tickerId].m_symbol + \
+                               '_' + self.wb.contracts[tickerId].m_secType
         tick['volume'] = int(tick['volume'])
         tick['bid'] = tools.to_decimal(tick['bid'])
         tick['bidsize'] = int(tick['bidsize'])
@@ -570,7 +591,7 @@ class Blotter():
         self.cash_ticks[symbol] = dict(tick)
 
         # assign timestamp
-        tick['timestamp'] = self.ibConn.optionsData[tickerId].index[0]
+        tick['timestamp'] = self.wb.optionsData[tickerId].index[0]
         if tick['timestamp'] == 0:
             tick['timestamp'] = datetime.utcnow().strftime(
                 ibDataTypes['DATE_TIME_FORMAT_LONG_MILLISECS'])
@@ -586,16 +607,16 @@ class Blotter():
             self.broadcast(tick, "QUOTE")
 
         # except Exception as e:
-            # pass
+        # pass
 
     # -------------------------------------------
     @asynctools.multitasking.task
     def on_orderbook_received(self, tickerId):
-        orderbook = self.ibConn.marketDepthData[tickerId].dropna(
+        orderbook = self.wb.marketDepthData[tickerId].dropna(
             subset=['bid', 'ask']).fillna(0).to_dict(orient='list')
 
         # add symbol data to list
-        symbol = self.ibConn.tickerSymbol(tickerId)
+        symbol = self.wb.tickerSymbol(tickerId)
         orderbook['symbol'] = symbol
         orderbook["symbol_group"] = tools.gen_symbol_group(symbol)
         orderbook["asset_class"] = tools.gen_asset_class(symbol)
@@ -610,9 +631,8 @@ class Blotter():
         # data
         symbol = tick['symbol']
         timestamp = datetime.strptime(tick['timestamp'],
-                                      ibDataTypes["DATE_TIME_FORMAT_LONG_MILLISECS"])
-
-        # do not act on first tick (timezone is incorrect)
+                                      ibDataTypes[
+                                          "DATE_TIME_FORMAT_LONG_MILLISECS"])  # do not act on first tick (timezone is incorrect)
         if self.first_tick:
             self.first_tick = False
             return
@@ -632,7 +652,8 @@ class Blotter():
         # send tick to message self.broadcast
         tick["kind"] = "TICK"
         self.broadcast(tick, "TICK")
-        self.log2db(tick, "TICK")
+        tickStore = Tick(**tick)
+        self.log2db(tickStore)
 
         # add tick to raw self._bars
         tick_data = pd.DataFrame(index=['timestamp'],
@@ -650,6 +671,8 @@ class Blotter():
 
         opened_bar = ohlc
         opened_bar['volume'] = vol
+        # print("----------------------")
+        # print(ohlc)
 
         # add bar to self._bars object
         previous_bar_count = len(self._bars[symbol])
@@ -658,7 +681,7 @@ class Blotter():
             self._bars[symbol].index).last()
 
         if len(self._bars[symbol].index) > previous_bar_count:
-
+            print("__Bars__ ", self._bars[symbol].to_dict(orient='records')[0])
             bar = self._bars[symbol].to_dict(orient='records')[0]
             bar["symbol"] = symbol
             bar["symbol_group"] = tick['symbol_group']
@@ -668,7 +691,8 @@ class Blotter():
 
             bar["kind"] = "BAR"
             self.broadcast(bar, "BAR")
-            self.log2db(bar, "BAR")
+            barStore = OHLC(**bar, tickerId=tick['tickerId'])
+            self.log2db(barStore)
 
             self._bars[symbol] = self._bars[symbol][-1:]
             _raw_bars.drop(_raw_bars.index[:], inplace=True)
@@ -695,51 +719,10 @@ class Blotter():
             pass
 
     # -------------------------------------------
-    def log2db(self, data, kind):
-        if self.args['dbskip'] or len(data["symbol"].split("_")) > 2:
+    def log2db(self, data):
+        if self.args['dbskip']:
             return
-
-        # connect to mysql per call (thread safe)
-        if self.threads > 0:
-            dbconn = self.get_mysql_connection()
-            dbcurr = dbconn.cursor()
-        else:
-            dbconn = self.dbconn
-            dbcurr = self.dbcurr
-
-        # set symbol details
-        symbol_id = 0
-        symbol = data["symbol"].replace("_" + data["asset_class"], "")
-
-        if symbol in self.symbol_ids.keys():
-            symbol_id = self.symbol_ids[symbol]
-        else:
-            symbol_id = get_symbol_id(
-                data["symbol"], dbconn, dbcurr, self.ibConn)
-            self.symbol_ids[symbol] = symbol_id
-
-        # insert to db
-        if kind == "TICK":
-            try:
-                mysql_insert_tick(data, symbol_id, dbcurr)
-            except Exception as e:
-                pass
-        elif kind == "BAR":
-            try:
-                mysql_insert_bar(data, symbol_id, dbcurr)
-            except Exception as e:
-                pass
-
-        # commit
-        try:
-            dbconn.commit()
-        except Exception as e:
-            pass
-
-        # disconect from mysql
-        if self.threads > 0:
-            dbcurr.close()
-            dbconn.close()
+        data.save()
 
     # -------------------------------------------
     def run(self):
@@ -752,7 +735,7 @@ class Blotter():
         self._check_unique_blotter()
 
         # connect to mysql
-        self.mysql_connect()
+        self.mongo_connect()
 
         self.context = zmq.Context(zmq.REP)
         self.socket = self.context.socket(zmq.PUB)
@@ -764,15 +747,19 @@ class Blotter():
         first_run = True
 
         self.log_blotter.info("Connecting to Interactive Brokers...")
-        self.ibConn = ezIBpy()
-        self.ibConn.ibCallback = self.ibCallback
+        # self.ibConn = ezIBpy()
+        # self.ibConn.ibCallback = self.ibCallback
 
-        while not self.ibConn.connected:
-            self.ibConn.connect(clientId=int(self.args['ibclient']),
-                                port=int(self.args['ibport']), host=str(self.args['ibserver']))
-            time.sleep(1)
-            if not self.ibConn.connected:
-                print('*', end="", flush=True)
+        self.wb = webull()
+        self.wb.callbacks = self.callbacks
+        self.wb.connect(stream=True)
+
+        # while not self.ibConn.connected:
+        #     self.ibConn.connect(clientId=int(self.args['ibclient']),
+        #                         port=int(self.args['ibport']), host=str(self.args['ibserver']))
+        #     time.sleep(1)
+        #     if not self.ibConn.connected:
+        #         print('*', end="", flush=True)
         self.log_blotter.info("Connection established...")
 
         try:
@@ -795,7 +782,7 @@ class Blotter():
                     if db_size == 0:
                         if prev_contracts:
                             self.log_blotter.info('Cancel market data...')
-                            self.ibConn.cancelMarketData()
+                            self.wb.cancelMarketDataSubscription()
                             time.sleep(0.1)
                             prev_contracts = []
                         continue
@@ -814,10 +801,10 @@ class Blotter():
 
                     # removed expired
                     df = df[(
-                            (df['expiry'] < 1000000) & (
-                                df['expiry'] >= int(datetime.now().strftime('%Y%m')))) | (
-                            (df['expiry'] >= 1000000) & (
-                                df['expiry'] >= int(datetime.now().strftime('%Y%m%d')))) |
+                                    (df['expiry'] < 1000000) & (
+                                    df['expiry'] >= int(datetime.now().strftime('%Y%m')))) | (
+                                    (df['expiry'] >= 1000000) & (
+                                    df['expiry'] >= int(datetime.now().strftime('%Y%m%d')))) |
                             np_isnan(df['expiry'])
                             ]
 
@@ -843,11 +830,11 @@ class Blotter():
                             # cancel market data for removed contracts
                             for contract in prev_contracts:
                                 if contract not in contracts:
-                                    self.ibConn.cancelMarketData(
+                                    self.wb.cancelMarketDataSubscription(
                                         self.ibConn.createContract(contract))
                                     if self.args['orderbook']:
-                                        self.ibConn.cancelMarketDepth(
-                                            self.ibConn.createContract(contract))
+                                        self.wb.cancelMarketDepth(
+                                            self.wb.createContract(contract))
                                     time.sleep(0.1)
                                     contract_string = self.ibConn.contractString(
                                         contract).split('_')[0]
@@ -857,20 +844,24 @@ class Blotter():
                     # request market data
                     for contract in contracts:
                         if contract not in prev_contracts:
-                            self.ibConn.requestMarketData(
-                                self.ibConn.createContract(contract))
-                            if self.args['orderbook']:
-                                self.ibConn.requestMarketDepth(
-                                    self.ibConn.createContract(contract))
+                            self.wb.subscribeMarketData(
+                                self.wb.createContract(contract))
+                            # if self.args['orderbook']:
+                            #     self.ibConn.requestMarketDepth(
+                            #         self.ibConn.createContract(contract))
                             time.sleep(0.1)
-                            contract_string = self.ibConn.contractString(
+                            contract_string = self.wb.contractString(
                                 contract).split('_')[0]
                             self.log_blotter.info(
                                 'Contract Added [%s]', contract_string)
 
                     # update latest contracts
-                    prev_contracts = contracts
+                    if prev_contracts != contracts:
+                        self.wb.reconnect()
+                        if not self.wb.started:
+                            self.wb.start()
 
+                    prev_contracts = contracts
                 time.sleep(2)
 
         except (KeyboardInterrupt, SystemExit):
@@ -898,22 +889,22 @@ class Blotter():
 
         # loop through data, symbol by symbol
         dfs = []
-        bad_ids = [blacklist['id'].values.tolist()]
+        bad_ids = [blacklist['_id'].values.tolist()]
 
-        for symbol_id in list(df['symbol_id'].unique()):
+        for symbol_id in list(df['symbol'].unique()):
 
-            data = df[df['symbol_id'] == symbol_id].copy()
+            data = df[df['symbol'] == symbol_id].copy()
 
             # sort by id
-            data.sort_values('id', axis=0, ascending=True, inplace=False)
+            data.sort_values('datetime', axis=0, ascending=True, inplace=False)
 
             # convert index to column
-            data.loc[:, "ix"] = data.index
-            data.reset_index(inplace=True)
+            # data.loc[:, "ix"] = data.index
+            # data.reset_index(inplace=True)
 
             # find out of sequence ticks/bars
-            malformed = data.shift(1)[(data['id'] > data['id'].shift(1)) & (
-                data['datetime'] < data['datetime'].shift(1))]
+            malformed = data.shift(1)[(data['resolution'] != data['resolution'].shift(1)) & (
+                    data['datetime'] < data['datetime'].shift(1))]
 
             # cleanup rows
             if malformed.empty:
@@ -922,11 +913,11 @@ class Blotter():
             else:
                 # remove out of sequence rows + last row from data
                 index = [
-                    x for x in data.index.values if x not in malformed['ix'].values]
+                    x for x in data.index.values if x not in malformed['datetime'].values]
                 dfs.append(data.loc[index])
 
                 # add to bad id list (to remove from db)
-                bad_ids.append(list(malformed['id'].values))
+                bad_ids.append(list(malformed['_id'].values))
 
         # combine all lists
         data = pd.concat(dfs, sort=True)
@@ -937,17 +928,18 @@ class Blotter():
         # remove bad ids from db
         if bad_ids:
             bad_ids = list(map(str, map(int, bad_ids)))
-            self.dbcurr.execute("DELETE FROM greeks WHERE %s IN (%s)" % (
-                table.lower()[:-1] + "_id", ",".join(bad_ids)))
-            self.dbcurr.execute("DELETE FROM " + table.lower() +
-                                " WHERE id IN (%s)" % (",".join(bad_ids)))
-            try:
-                self.dbconn.commit()
-            except Exception as e:
-                self.dbconn.rollback()
+            # self.dbcurr.execute("DELETE FROM greeks WHERE %s IN (%s)" % (
+            #     table.lower()[:-1] + "_id", ",".join(bad_ids)))
+            # self.dbcurr.execute("DELETE FROM " + table.lower() +
+            #                     " WHERE id IN (%s)" % (",".join(bad_ids)))
+            # try:
+            #     self.dbconn.commit()
+            # except Exception as e:
+            #     self.dbconn.rollback()
+            self.log_blotter.warning("Bad Ids found", bad_ids)
 
         # return
-        return data.drop(['id', 'ix', 'index'], axis=1)
+        return data.drop(['_id'], axis=1)
 
     # -------------------------------------------
     def history(self, symbols, start, end=None, resolution="1T", tz="UTC", continuous=True):
@@ -975,51 +967,63 @@ class Blotter():
                 pass
 
         # connect to mysql
-        self.mysql_connect()
+        self.mongo_connect()
 
         # --- build query
         table = 'ticks' if resolution[-1] in ("K", "V", "S") else 'bars'
 
-        query = """SELECT tbl.*,
-            CONCAT(s.`symbol`, "_", s.`asset_class`) as symbol, s.symbol_group, s.asset_class, s.expiry,
-            g.price AS opt_price, g.underlying AS opt_underlying, g.dividend AS opt_dividend,
-            g.volume AS opt_volume, g.iv AS opt_iv, g.oi AS opt_oi,
-            g.delta AS opt_delta, g.gamma AS opt_gamma,
-            g.theta AS opt_theta, g.vega AS opt_vega
-            FROM `{TABLE}` tbl LEFT JOIN `symbols` s ON tbl.symbol_id = s.id
-            LEFT JOIN `greeks` g ON tbl.id = g.{TABLE_ID}
-            WHERE (`datetime` >= "{START}"{END_SQL}) """.replace(
-            '{START}', start).replace('{TABLE}', table).replace('{TABLE_ID}', table[:-1] + '_id')
-
-        if end is not None:
-            query = query.replace('{END_SQL}', ' AND `datetime` <= "{END}"')
-            query = query.replace('{END}', end)
-        else:
-            query = query.replace('{END_SQL}', '')
-
-        if symbols[0].strip() != "*":
-            if continuous:
-                query += """ AND ( s.`symbol_group` in ("{SYMBOL_GROUPS}") or
-                CONCAT(s.`symbol`, "_", s.`asset_class`) IN ("{SYMBOLS}") ) """
-                query = query.replace('{SYMBOLS}', '","'.join(symbols)).replace(
-                    '{SYMBOL_GROUPS}', '","'.join(symbol_groups))
-            else:
-                query += """ AND ( CONCAT(s.`symbol`, "_", s.`asset_class`) IN ("{SYMBOLS}") ) """
-                query = query.replace('{SYMBOLS}', '","'.join(symbols))
+        # query = """SELECT tbl.*,
+        #     CONCAT(s.`symbol`, "_", s.`asset_class`) as symbol, s.symbol_group, s.asset_class, s.expiry,
+        #     g.price AS opt_price, g.underlying AS opt_underlying, g.dividend AS opt_dividend,
+        #     g.volume AS opt_volume, g.iv AS opt_iv, g.oi AS opt_oi,
+        #     g.delta AS opt_delta, g.gamma AS opt_gamma,
+        #     g.theta AS opt_theta, g.vega AS opt_vega
+        #     FROM `{TABLE}` tbl LEFT JOIN `symbols` s ON tbl.symbol_id = s.id
+        #     LEFT JOIN `greeks` g ON tbl.id = g.{TABLE_ID}
+        #     WHERE (`datetime` >= "{START}"{END_SQL}) """.replace(
+        #     '{START}', start).replace('{TABLE}', table).replace('{TABLE_ID}', table[:-1] + '_id')
+        #
+        # if end is not None:
+        #     query = query.replace('{END_SQL}', ' AND `datetime` <= "{END}"')
+        #     query = query.replace('{END}', end)
+        # else:
+        #     query = query.replace('{END_SQL}', '')
+        #
+        # if symbols[0].strip() != "*":
+        #     if continuous:
+        #         query += """ AND ( s.`symbol_group` in ("{SYMBOL_GROUPS}") or
+        #         CONCAT(s.`symbol`, "_", s.`asset_class`) IN ("{SYMBOLS}") ) """
+        #         query = query.replace('{SYMBOLS}', '","'.join(symbols)).replace(
+        #             '{SYMBOL_GROUPS}', '","'.join(symbol_groups))
+        #     else:
+        #         query += """ AND ( CONCAT(s.`symbol`, "_", s.`asset_class`) IN ("{SYMBOLS}") ) """
+        #         query = query.replace('{SYMBOLS}', '","'.join(symbols))
         # --- end build query
 
+        query = {
+            'resolution': resolution
+        }
+        if symbols[0].strip() != "*":
+            query['symbol__in'] = symbols
+
+        partQuery = (Q(datetime__gte=start) & Q(datetime__lte=end))
         # get data using pandas
-        data = pd.read_sql(query, self.dbconn)  # .dropna()
+        data = OHLC.objects(partQuery, **query).order_by('datetime')  # pd.read_sql(query, self.dbconn)  # .dropna()
 
-        # no data in db
-        if data.empty:
-            return data
+        df = pd.DataFrame.from_records([json.loads(d.to_json()) for d in data])
+        # del df['_id']
+        if df.empty:
+            return df
 
+        df['_id'] = df['_id'].apply(lambda _id: _id['$oid'])
+        df['datetime'] = df['datetime'].apply(lambda date: datetime.fromtimestamp(int(date['$date'] / 1000)))
+
+        # print(df)
         # clearup records that are out of sequence
-        data = self._fix_history_sequence(data, table)
+        data = self._fix_history_sequence(df, table)
 
         # setup dataframe
-        return prepare_history(data=data, resolution=resolution, tz=tz, continuous=True)
+        return prepare_history(data=data, resolution=Timeframes.timeframe_to_resolution(resolution), tz=tz, continuous=True)
 
     # -------------------------------------------
     def stream(self, symbols, tick_handler=None, bar_handler=None,
@@ -1069,7 +1073,7 @@ class Blotter():
                     df = pd.DataFrame(index=[0], data=data)
                     df.set_index('datetime', inplace=True)
                     df.index = pd.to_datetime(df.index, utc=True)
-                    df.drop(["timestamp", "kind"], axis=1, inplace=True)
+                    # df.drop(["timestamp", "kind"], axis=1, inplace=True)
 
                     try:
                         df.index = df.index.tz_convert(tz)
@@ -1114,7 +1118,7 @@ class Blotter():
             sys.exit(1)
 
     # ---------------------------------------
-    def backfill(self, data, resolution, start, end=None):
+    def backfill(self, data, resolution, start, end=None, csv_path=None):
         """
         Backfills missing historical data
 
@@ -1150,32 +1154,30 @@ class Blotter():
             first_date = tools.datetime64_to_datetime(data.index.values[0])
             last_date = tools.datetime64_to_datetime(data.index.values[-1])
 
-        ib_lookback = None
-        if start_date < first_date:
-            ib_lookback = tools.ib_duration_str(start_date)
-        elif end_date > last_date:
-            ib_lookback = tools.ib_duration_str(last_date)
+        self.backfill_resolution = resolution
 
-        if not ib_lookback:
+        wb_lookback = None
+        if start_date < first_date:
+            wb_lookback = tools.wb_lookback_str(start_date, end_date, self.backfill_resolution)
+        elif end_date > last_date:
+            wb_lookback = tools.wb_lookback_str(last_date, end_date, self.backfill_resolution)
+
+        if not wb_lookback:
             self.backfilled = True
             return None
 
-        self.backfill_resolution = "1 min" if resolution[-1] not in (
-            "K", "V", "S") else "1 sec"
         self.log_blotter.warning("Backfilling historical data from IB...")
 
         # request parameters
         params = {
-            "lookback": ib_lookback,
-            "resolution": self.backfill_resolution,
-            "data": "TRADES",
-            "rth": False,
-            "end_datetime": None,
-            "csv_path": None
+            "lookback": ceil(wb_lookback),
+            "resolution": Timeframes.timeframe_to_one_minutes(self.backfill_resolution),
+            "end_datetime": int(end_date.timestamp()),
+            "csv_path": csv_path
         }
 
         # if connection is active - request data
-        self.ibConn.requestHistoricalData(**params)
+        self.wb.requestHistoricalData(**params)
 
         # wait for backfill to complete
         while not self.backfilled:
@@ -1207,68 +1209,25 @@ class Blotter():
         tools.chmod(self.args['symbols'])
 
     # -------------------------------------------
-    def get_mysql_connection(self):
-        if self.args['dbskip']:
-            return None
 
-        return pymysql.connect(
-            client_flag=MULTI_STATEMENTS,
-            host=str(self.args['dbhost']),
-            port=int(self.args['dbport']),
-            user=str(self.args['dbuser']),
-            passwd=str(self.args['dbpass']),
-            db=str(self.args['dbname'])
-        )
-
-    def mysql_connect(self):
-
+    def mongo_connect(self):
         # skip db connection
         if self.args['dbskip']:
             return
 
         # already connected?
-        if self.dbcurr is not None or self.dbconn is not None:
+        if self.dbconn is not None:
             return
 
         # connect to mysql
-        self.dbconn = self.get_mysql_connection()
-        self.dbcurr = self.dbconn.cursor()
-
-        # check for db schema
-        self.dbcurr.execute("SHOW TABLES")
-        tables = [table[0] for table in self.dbcurr.fetchall()]
-
-        required = ["bars", "ticks", "symbols",
-                    "trades", "greeks", "_version_"]
-        if all(item in tables for item in required):
-            self.dbcurr.execute("SELECT version FROM `_version_`")
-            db_version = self.dbcurr.fetchone()
-            if db_version is not None and __version__ == db_version[0]:
-                return
-
-        # create database schema
-        self.dbcurr.execute(open(path['library'] + '/schema.sql', "rb").read())
-        try:
-            self.dbconn.commit()
-
-            # update version #
-            sql = "TRUNCATE TABLE _version_; INSERT INTO _version_ (`version`) VALUES (%s)"
-            self.dbcurr.execute(sql, (__version__))
-            self.dbconn.commit()
-
-            # unless we do this, there's a problem with curr.fetchX()
-            self.dbcurr.close()
-            self.dbconn.close()
-
-            # re-connect to mysql
-            self.dbconn = self.get_mysql_connection()
-            self.dbcurr = self.dbconn.cursor()
-
-        except Exception as e:
-            self.dbconn.rollback()
-            self.log_blotter.error("Cannot create database schema")
-            self._remove_cached_args()
-            sys.exit(1)
+        params = {
+            'host': str(self.args['dbhost']) if str(self.args['dbhost']) is not None else 'localhost',
+            'port': int(self.args['dbport']) if self.args['dbport'] is not None else 27017,
+            'username': str(self.args['dbuser']) if str(self.args['dbuser']) is not None else None,
+            'password': str(self.args['dbpass']) if str(self.args['dbpass']) is not None else None,
+            'db': str(self.args['dbname']) if str(self.args['dbname']) else 'qtpy'
+        }
+        self.dbconn = connect(**params)
 
     # ===========================================
     # Utility functions --->
@@ -1323,6 +1282,7 @@ def load_blotter_args(blotter_name=None, logger=None):
 
     return args
 
+
 # -------------------------------------------
 
 
@@ -1346,6 +1306,7 @@ def get_symbol_id(symbol, dbconn, dbcurr, ibConn=None):
         symbol_id : int
             Symbol ID
     """
+
     def _get_contract_expiry(symbol, ibConn=None):
         # parse w/p ibConn
         if ibConn is None or isinstance(symbol, str):
@@ -1400,7 +1361,7 @@ def get_symbol_id(symbol, dbconn, dbcurr, ibConn=None):
             row = dbcurr.fetchone()
             if row is not None:
                 sql = "UPDATE `symbols` SET `expiry`='" + \
-                    str(expiry) + "' WHERE id=" + str(row[0])
+                      str(expiry) + "' WHERE id=" + str(row[0])
                 dbcurr.execute(sql)
                 try:
                     dbconn.commit()
@@ -1426,7 +1387,6 @@ def get_symbol_id(symbol, dbconn, dbcurr, ibConn=None):
 
 # -------------------------------------------
 def mysql_insert_tick(data, symbol_id, dbcurr):
-
     sql = """INSERT IGNORE INTO `ticks` (`datetime`, `symbol_id`,
         `bid`, `bidsize`, `ask`, `asksize`, `last`, `lastsize`)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -1448,15 +1408,15 @@ def mysql_insert_tick(data, symbol_id, dbcurr):
         try:
             dbcurr.execute(greeks_sql, (dbcurr.lastrowid,
                                         round(float(data["opt_price"]), 2), round(
-                                            float(data["opt_underlying"]), 5),
+                float(data["opt_underlying"]), 5),
                                         float(data["opt_dividend"]), int(
-                                            data["opt_volume"]),
+                data["opt_volume"]),
                                         float(data["opt_iv"]), float(
-                                            data["opt_oi"]),
+                data["opt_oi"]),
                                         float(data["opt_delta"]), float(
-                                            data["opt_gamma"]),
+                data["opt_gamma"]),
                                         float(data["opt_theta"]), float(
-                                            data["opt_vega"]),
+                data["opt_vega"]),
                                         ))
         except Exception as e:
             pass
@@ -1472,10 +1432,10 @@ def mysql_insert_bar(data, symbol_id, dbcurr):
     """
     dbcurr.execute(sql, (data["timestamp"], symbol_id,
                          float(data["open"]), float(data["high"]), float(
-                             data["low"]), float(data["close"]), int(data["volume"]),
+        data["low"]), float(data["close"]), int(data["volume"]),
                          float(data["open"]), float(data["high"]), float(
         data["low"]), float(data["close"]), int(data["volume"])
-    ))
+                         ))
 
     # add greeks
     if dbcurr.lastrowid and data["asset_class"] in ("OPT", "FOP"):
@@ -1488,44 +1448,44 @@ def mysql_insert_bar(data, symbol_id, dbcurr):
         try:
             dbcurr.execute(greeks_sql, (dbcurr.lastrowid,
                                         round(float(greeks["opt_price"]), 2), round(
-                                            float(greeks["opt_underlying"]), 5),
+                float(greeks["opt_underlying"]), 5),
                                         float(greeks["opt_dividend"]), int(
-                                            greeks["opt_volume"]),
+                greeks["opt_volume"]),
                                         float(greeks["opt_iv"]), float(
-                                            greeks["opt_oi"]),
+                greeks["opt_oi"]),
                                         float(greeks["opt_delta"]), float(
-                                            greeks["opt_gamma"]),
+                greeks["opt_gamma"]),
                                         float(greeks["opt_theta"]), float(
-                                            greeks["opt_vega"]),
+                greeks["opt_vega"]),
                                         ))
         except Exception as e:
             pass
+
 
 # -------------------------------------------
 
 
 def prepare_history(data, resolution="1T", tz="UTC", continuous=True):
-
     # setup dataframe
     data.set_index('datetime', inplace=True)
     data.index = pd.to_datetime(data.index, utc=True)
-    data['expiry'] = pd.to_datetime(data['expiry'], utc=True)
+    # data['expiry'] = pd.to_datetime(data['expiry'], utc=True)
 
     # remove _STK from symbol to match ezIBpy's formatting
-    data['symbol'] = data['symbol'].str.replace("_STK", "")
+    # data['symbol'] = data['symbol'].str.replace("_STK", "")
 
     # force options columns
     data = tools.force_options_columns(data)
 
     # construct continuous contracts for futures
     if continuous and resolution[-1] not in ("K", "V", "S"):
-        all_dfs = [data[data['asset_class'] != 'FUT']]
+        all_dfs = [data[~data['symbol'].str.contains('FUT')]]
 
         # generate dict of df per future
         futures_symbol_groups = list(
-            data[data['asset_class'] == 'FUT']['symbol_group'].unique())
+            data[data['symbol'].str.contains('FUT')]['symbol'].unique())
         for key in futures_symbol_groups:
-            future_group = data[data['symbol_group'] == key]
+            future_group = data[data['symbol'] == key]
             continuous = futures.create_continuous_contract(
                 future_group, resolution)
             all_dfs.append(continuous)

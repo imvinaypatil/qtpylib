@@ -11,3 +11,12 @@ requests>=2.10.0
 twilio>=6.0.0
 pyzmq>=15.2.1
 beautifulsoup4>=4.7.1
+webull
+pymongo>=3.10.1
+mongoengine
+pip~=20.1
+wheel~=0.34.2
+cryptography~=2.9.2
+py~=1.8.1
+lxml~=4.5.0
+setuptools~=41.2.0

@@ -32,6 +32,7 @@ import pandas as pd
 from numpy import nan
 
 from qtpylib.broker import Broker
+from qtpylib.tools import wb_resolution
 from qtpylib.workflow import validate_columns as validate_csv_columns
 from qtpylib.blotter import prepare_history
 from qtpylib import (
@@ -109,6 +110,7 @@ class Algo(Broker):
                  tick_window=1, bar_window=100, timezone="UTC", preload=None,
                  continuous=True, blotter=None, sms=None, log=None,
                  backtest=False, start=None, end=None, data=None, output=None,
+                 backfill=False,
                  ibclient=998, ibport=4001, ibserver="localhost", **kwargs):
 
         # detect algo name
@@ -145,6 +147,7 @@ class Algo(Broker):
         self.resolution = resolution.upper().replace("MIN", "T")
         self.timezone = timezone
         self.preload = preload
+        self.backfill = backfill
         self.continuous = continuous
 
         # -----------------------------------
@@ -296,6 +299,15 @@ class Algo(Broker):
 
         history = pd.DataFrame()
 
+        # start = self.backtest_start if self.backtest else tools.backdate(
+        #     self.preload)
+        # end = self.backtest_end if self.backtest else None
+        #
+        # self.blotter.wb = self.wb
+        # self.blotter.backfill(data=history,
+        #                       resolution=self.resolution,
+        #                       start=start, end=end, csv_path=self.backtest_csv)
+        # self.blotter.wb = None
         # get history from csv dir
         if self.backtest and self.backtest_csv:
             kind = "TICK" if self.resolution[-1] in ("S", "K", "V") else "BAR"
@@ -355,9 +367,9 @@ class Algo(Broker):
 
             # history needs backfilling?
             # self.blotter.backfilled = True
-            if not self.blotter.backfilled:
+            if not self.blotter.backfilled and self.backfill:
                 # "loan" Blotter our ibConn
-                self.blotter.ibConn = self.ibConn
+                self.blotter.wb = self.wb
 
                 # call the back fill
                 self.blotter.backfill(data=history,
@@ -375,13 +387,13 @@ class Algo(Broker):
                 )
 
                 # take our ibConn back :)
-                self.blotter.ibConn = None
+                self.blotter.wb = None
 
         # optimize pandas
         if not history.empty:
             history['symbol'] = history['symbol'].astype('category')
-            history['symbol_group'] = history['symbol_group'].astype('category')
-            history['asset_class'] = history['asset_class'].astype('category')
+            # history['symbol_group'] = history['symbol_group'].astype('category')
+            # history['asset_class'] = history['asset_class'].astype('category')
 
         if self.backtest:
             # initiate strategy
@@ -834,8 +846,8 @@ class Algo(Broker):
         # optimize pandas
         if len(self.bars) == 1:
             self.bars['symbol'] = self.bars['symbol'].astype('category')
-            self.bars['symbol_group'] = self.bars['symbol_group'].astype('category')
-            self.bars['asset_class'] = self.bars['asset_class'].astype('category')
+            # self.bars['symbol_group'] = self.bars['symbol_group'].astype('category')
+            # self.bars['asset_class'] = self.bars['asset_class'].astype('category')
 
         # new bar?
         hash_string = bar[:1]['symbol'].to_string().translate(
@@ -848,8 +860,7 @@ class Algo(Broker):
         self.bar_hashes[symbol] = this_bar_hash
 
         if newbar and handle_bar:
-            if self.bars[(self.bars['symbol'] == symbol) | (
-                    self.bars['symbol_group'] == symbol)].empty:
+            if self.bars[(self.bars['symbol'] == symbol)].empty:
                 return
             bar_instrument = self.get_instrument(symbol)
             if bar_instrument:

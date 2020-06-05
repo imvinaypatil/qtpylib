@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 import pymysql
 import ezibpy
+from mongoengine import connect
 
 from qtpylib.instrument import Instrument
 from qtpylib import (
@@ -44,6 +45,8 @@ from qtpylib import (
 from qtpylib.blotter import (
     Blotter, load_blotter_args
 )
+
+from .webull import webull
 
 decimal.getcontext().prec = 5
 
@@ -104,26 +107,26 @@ class Broker():
 
         # -----------------------------------
         # connect to IB
-        self.ibclient = int(ibclient)
-        self.ibport = int(ibport)
-        self.ibserver = str(ibserver)
-
-        self.ibConn = ezibpy.ezIBpy()
-        self.ibConn.ibCallback = self.ibCallback
-        # self.ibConnect()
-
-        connection_tries = 0
-        while not self.ibConn.connected:
-            self.ibConn.connect(clientId=self.ibclient,
-                                port=self.ibport, host=self.ibserver)
-            time.sleep(1)
-            if not self.ibConn.connected:
-                # print('*', end="", flush=True)
-                connection_tries += 1
-                if connection_tries > 10:
-                    self.log_broker.info(
-                        "Cannot connect to Interactive Brokers...")
-                    sys.exit(0)
+        # self.ibclient = int(ibclient)
+        # self.ibport = int(ibport)
+        # self.ibserver = str(ibserver)
+        #
+        self.wb = webull()
+        self.wb.callbacks = self.ibCallback
+        self.wb.connect(stream=False)
+        #
+        # connection_tries = 0
+        # while not self.ibConn.connected:
+        #     self.ibConn.connect(clientId=self.ibclient,
+        #                         port=self.ibport, host=self.ibserver)
+        #     time.sleep(1)
+        #     if not self.ibConn.connected:
+        #         # print('*', end="", flush=True)
+        #         connection_tries += 1
+        #         if connection_tries > 10:
+        #             self.log_broker.info(
+        #                 "Cannot connect to Interactive Brokers...")
+        #             sys.exit(0)
 
         self.log_broker.info("Connection established...")
 
@@ -133,12 +136,12 @@ class Broker():
         for instrument in instruments:
             try:
                 if isinstance(instrument, ezibpy.utils.Contract):
-                    instrument = self.ibConn.contract_to_tuple(instrument)
+                    instrument = self.wb.contract_to_tuple(instrument)
                 else:
                     instrument = tools.create_ib_tuple(instrument)
-                contractString = self.ibConn.contractString(instrument)
+                contractString = self.wb.contractString(instrument)
                 instrument_tuples_dict[contractString] = instrument
-                self.ibConn.createContract(instrument)
+                self.wb.createContract(instrument)
             except Exception as e:
                 pass
 
@@ -152,12 +155,12 @@ class Broker():
         self.trades = []
 
         # shortcut
-        self.account = self.ibConn.account
+        self.account = self.wb.account
 
         # use: self.orders.pending...
         self.orders = tools.make_object(
-            by_tickerid=self.ibConn.orders,
-            by_symbol=self.ibConn.symbol_orders,
+            by_tickerid=self.wb.orders,
+            by_symbol=self.wb.symbol_orders,
             pending_ttls={},
             pending={},
             filled={},
@@ -179,28 +182,39 @@ class Broker():
 
         # connect to mysql using blotter's settings
         if not self.blotter_args['dbskip']:
-            self.dbconn = pymysql.connect(
-                host=str(self.blotter_args['dbhost']),
-                port=int(self.blotter_args['dbport']),
-                user=str(self.blotter_args['dbuser']),
-                passwd=str(self.blotter_args['dbpass']),
-                db=str(self.blotter_args['dbname']),
-                autocommit=True
-            )
-            self.dbcurr = self.dbconn.cursor()
+            self.mongo_connect()
         # -----------------------------------
         # do stuff on exit
         atexit.register(self._on_exit)
 
     # ---------------------------------------
+    def mongo_connect(self):
+        # skip db connection
+        if self.blotter_args['dbskip']:
+            return
+
+        # already connected?
+        if self.dbconn is not None:
+            return
+
+        # connect to mysql
+        params = {
+            'host': str(self.blotter_args['dbhost']) if str(self.blotter_args['dbhost']) is not None else 'localhost',
+            'port': int(self.blotter_args['dbport']) if self.blotter_args['dbport'] is not None else 27017,
+            'username': str(self.blotter_args['dbuser']) if str(self.blotter_args['dbuser']) is not None else None,
+            'password': str(self.blotter_args['dbpass']) if str(self.blotter_args['dbpass']) is not None else None,
+            'db': str(self.blotter_args['dbname']) if str(self.blotter_args['dbname']) else 'qtpy'
+        }
+        self.dbconn = connect(**params)
+    # ---------------------------------------
     def add_instruments(self, *instruments):
         """ add instruments after initialization """
         for instrument in instruments:
             if isinstance(instrument, ezibpy.utils.Contract):
-                instrument = self.ibConn.contract_to_tuple(instrument)
-                contractString = self.ibConn.contractString(instrument)
+                instrument = self.wb.contract_to_tuple(instrument)
+                contractString = self.wb.contractString(instrument)
                 self.instruments[contractString] = instrument
-                self.ibConn.createContract(instrument)
+                self.wb.createContract(instrument)
 
         self.symbols = list(self.instruments.keys())
 
@@ -218,10 +232,10 @@ class Broker():
 
     def register_combo(self, parent, legs):
         """ add contracts to groups """
-        parent = self.ibConn.contractString(parent)
+        parent = self.wb.contractString(parent)
         legs_dict = {}
         for leg in legs:
-            leg = self.ibConn.contractString(leg)
+            leg = self.wb.contractString(leg)
             legs_dict[leg] = self.get_instrument(leg)
         self.instrument_combos[parent] = legs_dict
 
@@ -242,9 +256,9 @@ class Broker():
     def _on_exit(self):
         self.log_broker.info("Algo stopped...")
 
-        if self.ibConn is not None:
+        if self.wb is not None:
             self.log_broker.info("Disconnecting...")
-            self.ibConn.disconnect()
+            self.wb.disconnect()
 
         self.log_broker.info("Disconnecting from MySQL...")
         try:
@@ -254,11 +268,10 @@ class Broker():
             pass
 
     # ---------------------------------------
-    def ibConnect(self):
-        self.ibConn.connect(clientId=self.ibclient,
-                            host=self.ibserver, port=self.ibport)
-        self.ibConn.requestPositionUpdates(subscribe=True)
-        self.ibConn.requestAccountUpdates(subscribe=True)
+    def connect(self):
+        self.wb.connect()
+        # self.wb.requestPositionUpdates(subscribe=True)
+        # self.wb.requestAccountUpdates(subscribe=True)
 
     # ---------------------------------------
     # @abstractmethod
@@ -266,15 +279,15 @@ class Broker():
 
         if caller == "handleHistoricalData":
             # transmit "as-is" to blotter for handling
-            self.blotter.ibCallback("handleHistoricalData", msg, **kwargs)
+            self.blotter.callbacks("handleHistoricalData", msg, **kwargs)
 
         if caller == "handleConnectionClosed":
             self.log_broker.info("Lost conncetion to Interactive Brokers...")
 
-            while not self.ibConn.connected:
-                self.ibConnect()
+            while not self.wb.connected:
+                self.connect()
                 time.sleep(1.3)
-                if not self.ibConn.connected:
+                if not self.wb.connected:
                     print('*', end="", flush=True)
 
             self.log_broker.info("Connection established...")
@@ -307,7 +320,7 @@ class Broker():
 
             # continue...
 
-            order = self.ibConn.orders[msg.orderId]
+            order = self.wb.orders[msg.orderId]
 
             # print("***********************\n\n", order, "\n\n***********************")
             orderId = msg.orderId
@@ -629,17 +642,17 @@ class Broker():
         # create & submit order
         if not bracket:
             # simple order
-            order = self.ibConn.createOrder(order_quantity, limit_price,
+            order = self.wb.createOrder(order_quantity, limit_price,
                                             fillorkill=fillorkill,
                                             iceberg=iceberg,
                                             tif=tif)
 
-            orderId = self.ibConn.placeOrder(contract, order)
+            orderId = self.wb.placeOrder(contract, order)
             self.log_broker.debug('PLACE ORDER: %s %s', tools.contract_to_dict(
                 contract), tools.order_to_dict(order))
         else:
             # bracket order
-            order = self.ibConn.createBracketOrder(contract, order_quantity,
+            order = self.wb.createBracketOrder(contract, order_quantity,
                                                    entry=limit_price,
                                                    target=target,
                                                    stop=initial_stop,
@@ -705,7 +718,7 @@ class Broker():
     # ---------------------------------------
     def _cancel_order(self, orderId):
         if orderId is not None and orderId > 0:
-            self.ibConn.cancelOrder(orderId)
+            self.wb.cancelOrder(orderId)
 
     # ---------------------------------------
     def modify_order_group(self, symbol, orderId, entry=None,
@@ -768,11 +781,11 @@ class Broker():
     # ---------------------------------------
     def _cancel_orphan_orders(self, orderId):
         """ cancel child orders when parent is gone """
-        orders = self.ibConn.orders
+        orders = self.wb.orders
         for order in orders:
             order = orders[order]
             if order['parentId'] != orderId:
-                self.ibConn.cancelOrder(order['id'])
+                self.wb.cancelOrder(order['id'])
 
     # ---------------------------------------
     def _cancel_expired_pending_orders(self):
@@ -788,7 +801,7 @@ class Broker():
 
             # cancel order if expired
             if delta < 0:
-                self.ibConn.cancelOrder(orderId)
+                self.wb.cancelOrder(orderId)
                 if orderId in self.orders.pending_ttls:
                     if orderId in self.orders.pending_ttls:
                         del self.orders.pending_ttls[orderId]
@@ -798,7 +811,7 @@ class Broker():
 
     # ---------------------------------------------------------
     def _expire_pending_order(self, symbol, orderId):
-        self.ibConn.cancelOrder(orderId)
+        self.wb.cancelOrder(orderId)
 
         if orderId in self.orders.pending_ttls:
             del self.orders.pending_ttls[orderId]
@@ -872,25 +885,25 @@ class Broker():
 
     # ---------------------------------------
     def get_account(self):
-        return self.ibConn.account
+        return self.wb.account
 
     # ---------------------------------------
     def get_contract(self, symbol):
-        return self.ibConn.contracts[self.ibConn.tickerId(symbol)]
+        return self.wb.contracts[self.wb.tickerId(symbol)]
 
     # ---------------------------------------
     def get_contract_details(self, symbol):
-        return self.ibConn.contractDetails(symbol)
+        return self.wb.contractDetails(symbol)
 
     # ---------------------------------------
     def get_tickerId(self, symbol):
-        return self.ibConn.tickerId(symbol)
+        return self.wb.tickerId(symbol)
 
     # ---------------------------------------
     def get_orders(self, symbol):
         symbol = self.get_symbol(symbol)
 
-        self.orders.by_symbol = self.ibConn.group_orders("symbol")
+        self.orders.by_symbol = self.wb.group_orders("symbol")
         if symbol in self.orders.by_symbol:
             return self.orders.by_symbol[symbol]
 
@@ -919,8 +932,8 @@ class Broker():
                     "account":  "Backtest"
                 }
 
-        elif symbol in self.ibConn.positions:
-            return self.ibConn.positions[symbol]
+        elif symbol in self.wb.positions:
+            return self.wb.positions[symbol]
 
         return {
             "symbol": symbol,
@@ -934,8 +947,8 @@ class Broker():
         if symbol is not None:
             symbol = self.get_symbol(symbol)
 
-            if symbol in self.ibConn.portfolio:
-                portfolio = self.ibConn.portfolio[symbol]
+            if symbol in self.wb.portfolio:
+                portfolio = self.wb.portfolio[symbol]
                 if "symbol" in portfolio:
                     return portfolio
 
@@ -951,7 +964,7 @@ class Broker():
                 "account":       None
             }
 
-        return self.ibConn.portfolio
+        return self.wb.portfolio
 
     # ---------------------------------------
     def get_pending_orders(self, symbol=None):

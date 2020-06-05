@@ -20,8 +20,11 @@
 
 import random
 
+import pytz
+
 from qtpylib.algo import Algo
 from qtpylib import futures
+from qtpylib.enums import Timeframes
 
 
 class TestStrategy(Algo):
@@ -42,9 +45,10 @@ class TestStrategy(Algo):
 
     # ---------------------------------------
     def on_quote(self, instrument):
-        # quote = instrument.get_quote()
-        # ^^ quote data available via get_quote()
         pass
+        # quote = instrument.get_quote()
+        # print(quote)
+        # ^^ quote data available via get_quote()
 
     # ---------------------------------------
     def on_orderbook(self, instrument):
@@ -56,7 +60,6 @@ class TestStrategy(Algo):
 
     # ---------------------------------------
     def on_tick(self, instrument):
-
         # increase counter and do nothing if nor 10th tick
         self.count += 1
 
@@ -67,43 +70,49 @@ class TestStrategy(Algo):
 
         # get last tick dict
         tick = instrument.get_ticks(lookback=1, as_dict=True)
+        print("-----------")
+        print("TICK: ", tick)
+        tz = pytz.timezone('Asia/Calcutta')
+        print(tick['datetime'].to_pydatetime().astimezone(tz))
 
-        if instrument.positions['position']:
-            print(instrument.symbol, "still in position. Exiting...")
-            instrument.exit()
-        else:
-            if instrument.pending_orders:
-                print(instrument.symbol, "has a pending order. Wait...")
-            else:
-                # random order direction
-                direction = random.choice(["BUY", "SELL"])
-                print(instrument.symbol,
-                      'not in position. Sending a bracket ', direction, 'order...')
-
-                if direction == "BUY":
-                    target = tick['last'] + 0.5
-                    stoploss = tick['last'] - 0.5
-                else:
-                    target = tick['last'] - 0.5
-                    stoploss = tick['last'] + 0.5
-
-                instrument.order(direction, 1,
-                                 limit_price=tick['last'],
-                                 target=target,
-                                 initial_stop=stoploss,
-                                 trail_stop_at=0,
-                                 trail_stop_by=0,
-                                 expiry=5
-                                 )
-
-                # record action
-                self.record(take_action=1)
+        # if instrument.positions['position']:
+        #     print(instrument.symbol, "still in position. Exiting...")
+        #     instrument.exit()
+        # else:
+        #     if instrument.pending_orders:
+        #         print(instrument.symbol, "has a pending order. Wait...")
+        #     else:
+        #         # random order direction
+        #         direction = random.choice(["BUY", "SELL"])
+        #         print(instrument.symbol,
+        #               'not in position. Sending a bracket ', direction, 'order...')
+        #
+        #         if direction == "BUY":
+        #             target = tick['last'] + 0.5
+        #             stoploss = tick['last'] - 0.5
+        #         else:
+        #             target = tick['last'] - 0.5
+        #             stoploss = tick['last'] + 0.5
+        #
+        #         instrument.order(direction, 1,
+        #                          limit_price=tick['last'],
+        #                          target=target,
+        #                          initial_stop=stoploss,
+        #                          trail_stop_at=0,
+        #                          trail_stop_by=0,
+        #                          expiry=5
+        #                          )
+        #
+        #         # record action
+        #         self.record(take_action=1)
 
     # ---------------------------------------
     def on_bar(self, instrument):
         # nothing exiting here...
         bar = instrument.get_bars(lookback=1, as_dict=True)
-        print("BAR:", bar)
+        print("**********")
+        tz = pytz.timezone('Asia/Calcutta')
+        print("BAR:", bar['datetime'].to_pydatetime().astimezone(tz), bar)
 
 
 
@@ -114,9 +123,14 @@ if __name__ == "__main__":
     print("Active month for ES is:", ACTIVE_MONTH)
 
     strategy = TestStrategy(
-        instruments=[("ES", "FUT", "GLOBEX", "USD", ACTIVE_MONTH, 0.0, "")],
-        resolution="1T",
-        tick_window=10,
-        bar_window=10
+        instruments=[("SBIN", "", "", "",), ("GLENMARK", "", "", "",)],
+        resolution=Timeframes.MINUTE_1,
+        tick_window=1,
+        bar_window=1,
+        preload="2D",
+        # backtest=True,
+        output="./output",
+        start="2020-05-12 12:15:00",
+        # backfill=False
     )
     strategy.run()
